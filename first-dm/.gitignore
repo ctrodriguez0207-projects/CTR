@@ -1,0 +1,4 @@
+# Personal data: handle lists, queue, logs, exports. Never commit (repo is public).
+data/
+*.zip
+__pycache__/
