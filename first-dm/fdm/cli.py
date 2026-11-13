@@ -7,13 +7,16 @@ import os
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import OTHER_ACCOUNT, SENDER
-from .adapters import NoInstagramAccess
-from .engine import (EXPECTED_OTHER_FOLLOWING, blockers, is_paused, pause, poll_reels, recheck_queue,
-                     recover_pending, requirement_status, send_one)
+import re
+
+from .adapters import ManualInstagram, NoInstagramAccess
+from .engine import (EXPECTED_OTHER_FOLLOWING, assist_next, assist_reserve, assist_result, blockers,
+                     ingest_likers, is_paused, next_allowed_at, pause, pending_attempts, poll_reels,
+                     recheck_queue, recover_pending, requirement_status, send_one)
 from .handles import normalize
 from .importers import ImportErrorReport, parse_following, parse_setsmart_csv
 from .schedule import DAILY_CAP, HOURLY_CAP, ET, to_et, utcnow
@@ -34,11 +37,36 @@ def get_store():
 
 
 def get_ig():
+    """Assisted mode (Cole is the Instagram integration) unless config.json says otherwise."""
     cfg = DATA / "config.json"
-    name = json.loads(cfg.read_text()).get("instagram_adapter", "none") if cfg.exists() else "none"
+    name = json.loads(cfg.read_text()).get("instagram_adapter", "manual") if cfg.exists() else "manual"
+    if name == "manual":
+        return ManualInstagram()
     if name != "none":
         print(f"! unknown instagram_adapter '{name}' in config.json; treating Instagram as unavailable")
     return NoInstagramAccess(NO_IG_WHY)
+
+
+UI_WORDS = {"follow", "following", "message", "requested", "remove", "verified", "likes", "liked", "search"}
+
+
+def parse_reel_id(raw):
+    m = re.search(r"instagram\.com/(?:reels?|p)/([A-Za-z0-9_-]+)", raw)
+    return m.group(1) if m else raw.strip()
+
+
+def parse_liker_lines(lines):
+    good, ignored = [], []
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        h = normalize(t)
+        if not h or h in UI_WORDS or " " in t:
+            ignored.append(t)
+        else:
+            good.append(h)
+    return list(dict.fromkeys(good)), ignored
 
 
 def _after_list_change(st):
@@ -124,6 +152,108 @@ def cmd_setsmart(a):
     return 0
 
 
+def cmd_likers(a):
+    st = get_store()
+    rid = parse_reel_id(a.reel)
+    lines = list(a.handles)
+    if a.file:
+        lines += Path(a.file).read_text().splitlines()
+    if not a.file and not a.handles:
+        print("Paste the Reel's visible likers, one handle per line. Finish with an empty line (or Ctrl-D):")
+        try:
+            while True:
+                ln = input()
+                if not ln.strip():
+                    break
+                lines.append(ln)
+        except EOFError:
+            pass
+    handles, ignored = parse_liker_lines(lines)
+    first = st.db.execute("SELECT 1 FROM reels WHERE reel_id=?", (rid,)).fetchone() is None
+    stats = ingest_likers(st, get_ig(), rid, [(h, None) for h in handles])
+    if first:
+        print(f"Reel {rid}: first look, so {stats['baseline_likers']} existing likers were recorded as the baseline. Nobody was queued.")
+    else:
+        q = stats.get("queued", 0)
+        sk = {k[8:]: v for k, v in stats.items() if k.startswith("skipped:")}
+        print(f"Reel {rid}: {stats.get('new_likes', 0)} new likers, {q} queued, "
+              f"{stats.get('duplicate_person', 0)} already known from another Reel, skipped: {sk or 'none'}")
+    if ignored:
+        print(f"Ignored {len(ignored)} lines that aren't handles (names/buttons): {ignored[:6]}{' ...' if len(ignored) > 6 else ''}")
+    return 0
+
+
+def _ask(prompt, choices):
+    while True:
+        ans = input(f"{prompt} [{'/'.join(choices)}] ").strip().lower()
+        if ans in choices:
+            return ans
+
+
+YN = {"y": True, "n": False, "?": None}
+
+
+def _resolve_pending(st):
+    for a in pending_attempts(st):
+        print(f"\nUnfinished attempt from {a['ts_et'][:16].replace('T', ' ')} ET to @{a['handle']}:")
+        print(f"  \"{a['message']}\"")
+        r = _ask("Did this message appear in their conversation? y = sent, u = unsure, n = I didn't send it, "
+                 "w = Instagram showed a warning/block/challenge", ["y", "u", "n", "w"])
+        out = assist_result(st, a["id"], {"y": "sent", "u": "uncertain", "n": "not_sent", "w": "warning"}[r])
+        print(f"  Recorded: {out}. @{a['handle']} will never be messaged again by this workflow.")
+
+
+def cmd_assist(a):
+    st = get_store()
+    if not getattr(get_ig(), "manual", False):
+        print("assist needs the manual Instagram adapter (config.json instagram_adapter = manual).")
+        return 1
+    _resolve_pending(st)
+    while True:
+        r = assist_next(st, pause_file=PAUSE_FILE)
+        if r[0] is None:
+            msg = r[1]
+            if msg.startswith("wait"):
+                t = next_allowed_at(st)
+                msg += f" — next attempt allowed at {to_et(t):%I:%M %p %Z on %a %b %d}" if t else ""
+            print("\n" + msg)
+            break
+        c, opener, text = r
+        print(f"\nNext: @{c['handle']}  (liked Reel {c['source_reel']})   https://www.instagram.com/{c['handle']}/")
+        print("All list checks passed (other account's Following, personal list, SetSmart DNC + history, this workflow's log).")
+        print("On Instagram, signed in as you, check:")
+        ans = {}
+        ans["signed_in_as_sender"] = YN[_ask("  Are you signed into @colethomasrod right now?", ["y", "n"])]
+        if not ans["signed_in_as_sender"]:
+            assist_reserve(st, c["id"], ans, pause_file=PAUSE_FILE)
+            print("Paused: wrong or unconfirmed account. Switch to @colethomasrod, then run: python3 -m fdm resume")
+            return 1
+        ans["intended_recipient"] = YN[_ask(f"  Is https://www.instagram.com/{c['handle']}/ the person who liked your Reel? (? = can't tell)", ["y", "n", "?"])]
+        ans["follows"] = YN[_ask("  Do YOU follow them? (their profile button says Following)", ["y", "n", "?"])]
+        ans["dm_thread"] = YN[_ask("  Is there ANY existing DM conversation with them (inbox, requests, hidden)?", ["y", "n", "?"])]
+        ans["can_message"] = YN[_ask("  Does Instagram let you message them (Message works, no restriction)?", ["y", "n", "?"])]
+        res = assist_reserve(st, c["id"], ans, pause_file=PAUSE_FILE)
+        if res[0] != "reserved":
+            print(f"Not messaging @{c['handle']}: {res[1]}")
+            if res[0] in ("paused", "wait"):
+                break
+            continue
+        _, aid, opener, text = res
+        print(f"\nReserved and counted. Send this exact message (opener #{opener}) to @{c['handle']}:\n\n    {text}\n")
+        out = _ask("Did it appear in @" + c["handle"] + "'s conversation? y = sent, u = unsure, n = I didn't send it, "
+                   "w = Instagram showed a warning/block/challenge", ["y", "u", "n", "w"])
+        final = assist_result(st, aid, {"y": "sent", "u": "uncertain", "n": "not_sent", "w": "warning"}[out])
+        print(f"Recorded: {final}.")
+        if a.once:
+            break
+    today = to_et(utcnow()).date().isoformat()
+    rows = [r for r in st.db.execute("SELECT outcome, ts_et FROM attempts") if r["ts_et"][:10] == today]
+    c = Counter(r["outcome"] for r in rows)
+    print(f"Today: {c['sent']} confirmed, {c['uncertain']} uncertain, {c['not_sent']} not sent; "
+          f"{len(rows)}/{DAILY_CAP} attempts used.")
+    return 0
+
+
 def cmd_status(a):
     st = get_store()
     ig = get_ig()
@@ -132,9 +262,15 @@ def cmd_status(a):
     print(f"Next opener: #{int(st.get('rotation_pos')) % 4 + 1} (rotation position {st.get('rotation_pos')})")
     print("\nRequired checks:")
     for name, desc, ok, detail in requirement_status(st, ig):
-        print(f"  [{'OK ' if ok else 'NO '}] {desc}\n         {detail}")
+        print(f"  [{('YOU' if 'Cole' in detail else 'OK ') if ok else 'NO '}] {desc}\n         {detail}")
     c = Counter(r["status"] for r in st.db.execute("SELECT status FROM candidates"))
     print("\nCandidates:", dict(c) or "none yet")
+    pend = pending_attempts(st)
+    if pend:
+        print(f"Unfinished attempts waiting for your answer: {len(pend)} (run: python3 -m fdm assist)")
+    t = next_allowed_at(st, utcnow() - timedelta(minutes=1))
+    if t:
+        print(f"Schedule allows the next attempt at {to_et(t):%I:%M %p %Z, %a %b %d}")
     return 0
 
 
@@ -216,6 +352,9 @@ def cmd_run(a):
         print("Another sender is already running. Only one sender may be active.")
         return 1
     ig = get_ig()
+    if getattr(ig, "manual", False):
+        print("Automatic sending isn't available (no supported Instagram integration). Use: python3 -m fdm assist")
+        return 1
     n = recover_pending(st)
     if n:
         print(f"Marked {n} interrupted attempt(s) as uncertain; they will not be retried.")
@@ -247,19 +386,30 @@ def cmd_summary(a):
     p, why = is_paused(st, PAUSE_FILE)
     lines = [f"# First-DM summary for {day} (Eastern)", "",
              f"- Mode: {st.get('mode')}; sending is {'PAUSED (' + why + ')' if p else 'active'}",
-             f"- Confirmed sends: {c['sent']}", f"- Uncertain attempts: {c['uncertain']}",
-             f"- Other outcomes: {dict((k, v) for k, v in c.items() if k not in ('sent', 'uncertain')) or 'none'}",
+             f"- Confirmed sends: {c['sent']}", f"- Uncertain attempts: {c['uncertain']}", f"- Reserved but not sent by Cole: {c['not_sent']}",
+             f"- Waiting for Cole's answer: {c['pending']}",
+             f"- Other outcomes: {dict((k, v) for k, v in c.items() if k not in ('sent', 'uncertain', 'not_sent', 'pending')) or 'none'}",
              f"- Attempts counted toward caps: {len(rows)} / {DAILY_CAP} daily (max {HOURLY_CAP} per hour)",
              f"- Skips by reason: {dict(skips) or 'none'}", "", "## Attempt log", "",
              "| Time (ET) | Recipient | Source Reel | Opener | Message | Outcome |", "|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append(f"| {r['ts_et'][11:19]} | @{r['handle']} | {r['source_reel']} | {r['opener']} | {r['message']} | {r['outcome']}{' — ' + r['detail'] if r['detail'] else ''} |")
+        lines.append(f"| {r['ts_et'][11:19]} | @{r['handle']} | {r['source_reel']} | {r['opener']} | {r['message']} | {r['outcome']}{_note(r['detail'])} |")
     text = "\n".join(lines)
     out = DATA / "summaries" / f"{day}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text)
     print(text)
     return 0
+
+
+def _note(detail):
+    if not detail:
+        return ""
+    try:
+        n = json.loads(detail).get("note")
+    except ValueError:
+        n = detail
+    return f" — {n}" if n else ""
 
 
 def cmd_config(a):
@@ -288,6 +438,14 @@ def main(argv=None):
     p.add_argument("file")
     p.add_argument("--exported-at", help="when you exported it, e.g. 2026-11-13T09:30-05:00 (default: file time)")
     p.set_defaults(f=cmd_setsmart)
+    p = sp.add_parser("likers", help="record a Reel's visible likers (first time = baseline)")
+    p.add_argument("reel", help="Reel URL or ID")
+    p.add_argument("handles", nargs="*")
+    p.add_argument("--file", help="text file, one handle per line")
+    p.set_defaults(f=cmd_likers)
+    p = sp.add_parser("assist", help="walk through the next first DMs you send by hand")
+    p.add_argument("--once", action="store_true", help="stop after one attempt")
+    p.set_defaults(f=cmd_assist)
     sp.add_parser("dry-run").set_defaults(f=cmd_dry_run)
     p = sp.add_parser("enable-live")
     p.add_argument("--approve", required=True, metavar="DRY_RUN_ID")

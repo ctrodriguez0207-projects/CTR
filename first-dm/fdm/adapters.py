@@ -13,6 +13,10 @@ class Unverifiable(Exception):
     """A check could not be verified for this one person."""
 
 
+class Deferred(Exception):
+    """Assisted mode: Cole answers this check on Instagram right before sending."""
+
+
 class AccountWarning(Exception):
     """Instagram warning, action block, login challenge, or rate limit. Pauses everything."""
 
@@ -117,3 +121,41 @@ class FixtureInstagram(InstagramAdapter):
         if handle in self.d.get("unconfirmable", []):
             return False
         return (handle, text) in self.sent
+
+
+class ManualInstagram(InstagramAdapter):
+    """Assisted mode. Cole is the Instagram integration: he pastes the visible
+    likers of his Reels and, right before each send, confirms on Instagram the
+    checks the workflow cannot read (signed-in account, intended recipient,
+    whether he follows them, any existing DM thread, whether messaging is
+    allowed). He sends the message himself and reports whether it appeared."""
+    name = "manual"
+    manual = True
+    HOW = "Cole checks on Instagram before each send (assisted mode)"
+
+    def __init__(self, attest=None):
+        # attest: {"follows": bool|None, "dm_thread": bool|None, "can_message": bool|None}
+        # None for a key = "can't tell" -> Unverifiable for that person.
+        self.attest = attest
+
+    def capabilities(self):
+        caps = {c: (True, self.HOW) for c in CAPABILITIES}
+        caps["list_owned_reels"] = caps["list_reel_likers"] = (True, "Cole pastes each Reel's visible likers")
+        return caps
+
+    def _ans(self, key, label):
+        if self.attest is None:
+            raise Deferred(label)
+        v = self.attest.get(key)
+        if v is None:
+            raise Unverifiable(f"Cole could not verify: {label}")
+        return v
+
+    def sender_follows(self, handle, account_id=None):
+        return self._ans("follows", "does @colethomasrod follow them")
+
+    def dm_thread_exists(self, handle, account_id=None):
+        return self._ans("dm_thread", "any existing DM conversation")
+
+    def can_message(self, handle, account_id=None):
+        return self._ans("can_message", "Instagram allows messaging them")

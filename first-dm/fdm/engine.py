@@ -1,10 +1,11 @@
 """Core workflow: baseline/monitor Reels, queue candidates, exclusions,
 gated live sending with reservation, confirmation and pause handling."""
+import json
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from . import SENDER
-from .adapters import AccountWarning, Unavailable, Unverifiable
+from .adapters import AccountWarning, Deferred, ManualInstagram, Unavailable, Unverifiable
 from .handles import normalize
 from .openers import compose
 from .schedule import can_attempt, to_et, utcnow
@@ -66,7 +67,9 @@ def requirement_status(store, ig, now=None):
         out.append((name, desc, ok, detail + (" [TEST DATA]" if test and name.startswith(("ig_", "check1", "check5_ig", "check7")) else "")))
 
     ok, why = _cap(ig, "whoami")
-    if ok:
+    if getattr(ig, "manual", False):
+        add("ig_session", True, "Cole confirms he is signed into @colethomasrod before each send")
+    elif ok:
         try:
             who = normalize(ig.whoami())
             add("ig_session", who == SENDER, f"signed in as @{who}")
@@ -126,6 +129,8 @@ def evaluate(store, ig, handle, account_id=None, strict=True):
             rec(check, "excluded" if v == bad_if else "pass")
         except Unverifiable as e:
             rec(check, "unverifiable", str(e))
+        except Deferred as e:
+            rec(check, "manual_pending", str(e))
         except Unavailable as e:
             if strict:
                 raise
@@ -184,26 +189,34 @@ def poll_reels(store, ig):
             stats["reel_not_owned_ignored"] += 1
             continue
         rid = reel["reel_id"]
-        likers = [(normalize(h), aid) for h, aid in ig.list_reel_likers(rid)]
-        likers = [(h, aid) for h, aid in likers if h]
-        known = store.db.execute("SELECT 1 FROM reels WHERE reel_id=?", (rid,)).fetchone()
-        if not known:
-            with store.tx():
-                store.db.execute("INSERT INTO reels VALUES (?,?,?,?)", (rid, SENDER, now_iso(), len(likers)))
-                for h, aid in likers:
-                    store.db.execute("INSERT OR IGNORE INTO reel_likers VALUES (?,?,?,?,1)", (rid, h, aid, now_iso()))
-            store.event("reel_baselined", reel=rid, likers=len(likers))
-            stats["baseline_likers"] += len(likers)
+        ingest_likers(store, ig, rid, ig.list_reel_likers(rid), stats)
+    return stats
+
+
+def ingest_likers(store, ig, rid, raw_likers, stats=None):
+    """First time a Reel is seen: record visible likers as baseline (queue nobody).
+    Later: queue only likers not seen on that Reel before."""
+    stats = stats if stats is not None else Counter()
+    likers = [(normalize(h), aid) for h, aid in raw_likers]
+    likers = [(h, aid) for h, aid in likers if h]
+    known = store.db.execute("SELECT 1 FROM reels WHERE reel_id=?", (rid,)).fetchone()
+    if not known:
+        with store.tx():
+            store.db.execute("INSERT INTO reels VALUES (?,?,?,?)", (rid, SENDER, now_iso(), len(likers)))
+            for h, aid in likers:
+                store.db.execute("INSERT OR IGNORE INTO reel_likers VALUES (?,?,?,?,1)", (rid, h, aid, now_iso()))
+        store.event("reel_baselined", reel=rid, likers=len(likers))
+        stats["baseline_likers"] += len(likers)
+        return stats
+    for h, aid in likers:
+        cur = store.db.execute("INSERT OR IGNORE INTO reel_likers VALUES (?,?,?,?,0)", (rid, h, aid, now_iso()))
+        if not cur.rowcount:
             continue
-        for h, aid in likers:
-            cur = store.db.execute("INSERT OR IGNORE INTO reel_likers VALUES (?,?,?,?,0)", (rid, h, aid, now_iso()))
-            if not cur.rowcount:
-                continue
-            stats["new_likes"] += 1
-            if find_candidate(store, h, aid):
-                stats["duplicate_person"] += 1   # liked several Reels: one candidate
-                continue
-            queue_candidate(store, ig, h, aid, rid, stats)
+        stats["new_likes"] += 1
+        if find_candidate(store, h, aid):
+            stats["duplicate_person"] += 1   # liked several Reels: one candidate
+            continue
+        queue_candidate(store, ig, h, aid, rid, stats)
     return stats
 
 
@@ -340,3 +353,133 @@ def send_one(store, ig, now=None, pause_file=None):
             pause(store, "repeated inability to confirm sends")
         return f"{outcome}: @{c['handle']} opener {opener}"
     return "idle: no eligible candidates"
+
+
+# ------------------------------------------------------------ assisted mode
+
+def _gate(store, ig, now, pause_file):
+    if store.get("mode") != "live":
+        return "not_live: run dry-run, review it, then enable-live --approve <ID>"
+    p, why = is_paused(store, pause_file)
+    if p:
+        return "paused: " + why
+    bl = blockers(store, ig, now)
+    if bl:
+        pause(store, "required check unavailable: " + "; ".join(f"{n} ({d})" for n, d in bl))
+        return "paused: " + store.get("pause_reason")
+    ok, why = can_attempt(now, store.counted_attempt_times())
+    if not ok:
+        return "wait: " + why
+    return None
+
+
+def assist_next(store, now=None, pause_file=None):
+    """Pick the next candidate whose list-based checks all pass. Nothing is
+    reserved or counted here. Returns (candidate_row, opener, text) or (None, reason)."""
+    now = now or utcnow()
+    ig = ManualInstagram()
+    g = _gate(store, ig, now, pause_file)
+    if g:
+        return None, g
+    for c in store.db.execute("SELECT * FROM candidates WHERE status='queued' ORDER BY id").fetchall():
+        try:
+            verdict, reason, _ = evaluate(store, ig, c["handle"], c["account_id"])
+        except Unavailable as e:
+            pause(store, f"required check unavailable: {e}")
+            return None, "paused: " + store.get("pause_reason")
+        if verdict != "eligible":
+            store.db.execute("UPDATE candidates SET status='skipped', reason=?, checked_at=? WHERE id=?",
+                             (reason, now_iso(), c["id"]))
+            continue
+        opener, text = compose(int(store.get("rotation_pos")), c["handle"])
+        return c, opener, text
+    return None, "idle: no eligible candidates in the queue"
+
+
+def assist_reserve(store, candidate_id, answers, now=None, pause_file=None):
+    """Cole's answers for one person, given right before sending:
+    signed_in_as_sender, intended_recipient, follows, dm_thread, can_message
+    (True/False, or None = can't tell). Re-runs every exclusion and every gate.
+    If all pass: reserves the person, counts the attempt, advances the rotation
+    and returns ("reserved", attempt_id, opener, text). Otherwise ("skipped"|"paused"|"wait", reason)."""
+    now = now or utcnow()
+    c = store.db.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+    if not c or c["status"] != "queued":
+        return "skipped", "candidate is no longer queued"
+    if answers.get("signed_in_as_sender") is not True:
+        pause(store, "account mismatch or unconfirmed: Cole did not confirm the session is @colethomasrod")
+        return "paused", store.get("pause_reason")
+    ig = ManualInstagram(answers)
+    g = _gate(store, ig, now, pause_file)
+    if g:
+        return g.split(":")[0], g
+    if answers.get("intended_recipient") is not True:
+        reason = "unverifiable:intended_recipient" if answers.get("intended_recipient") is None else "wrong_profile"
+        store.db.execute("UPDATE candidates SET status='skipped', reason=?, checked_at=? WHERE id=?",
+                         (reason, now_iso(), c["id"]))
+        return "skipped", reason
+    try:
+        verdict, reason, trace = evaluate(store, ig, c["handle"], c["account_id"])
+    except Unavailable as e:
+        pause(store, f"required check unavailable: {e}")
+        return "paused", store.get("pause_reason")
+    if verdict != "eligible":
+        store.db.execute("UPDATE candidates SET status='skipped', reason=?, checked_at=? WHERE id=?",
+                         (reason, now_iso(), c["id"]))
+        return "skipped", reason
+    with store.tx():
+        if store.get("paused") == "1" or (pause_file is not None and pause_file.exists()):
+            return "paused", "paused just before reserving"
+        pos = int(store.get("rotation_pos"))
+        opener, text = compose(pos, c["handle"])
+        cur = store.db.execute(
+            "INSERT INTO attempts (ts_utc, ts_et, candidate_id, handle, account_id, source_reel, opener, message, outcome, detail) VALUES (?,?,?,?,?,?,?,?, 'pending', ?)",
+            (now.isoformat(timespec="seconds"), to_et(now).isoformat(timespec="seconds"), c["id"], c["handle"],
+             c["account_id"], c["source_reel"], opener, text,
+             json.dumps({"cole_confirmed": {k: answers.get(k) for k in
+                         ("signed_in_as_sender", "intended_recipient", "follows", "dm_thread", "can_message")}})))
+        store.set("rotation_pos", pos + 1)
+        store.db.execute("UPDATE candidates SET status='attempting' WHERE id=?", (c["id"],))
+    return "reserved", cur.lastrowid, opener, text
+
+
+ASSIST_OUTCOMES = {"sent", "uncertain", "not_sent", "warning"}
+
+
+def assist_result(store, attempt_id, outcome, note=""):
+    """sent: Cole saw the message in the right conversation.
+    uncertain: not sure. not_sent: Cole didn't send it (still counted, never retried).
+    warning: Instagram showed a warning/block/challenge (recorded uncertain; pauses)."""
+    if outcome not in ASSIST_OUTCOMES:
+        raise ValueError(outcome)
+    a = store.db.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+    if not a or a["outcome"] != "pending":
+        raise ValueError("attempt is not pending")
+    final = "uncertain" if outcome == "warning" else outcome
+    old = json.loads(a["detail"] or "{}")
+    old["note"] = note or ("Instagram warning/block/challenge" if outcome == "warning" else "")
+    store.db.execute("UPDATE attempts SET outcome=?, detail=? WHERE id=?", (final, json.dumps(old), attempt_id))
+    store.db.execute("UPDATE candidates SET status=? WHERE id=?", (final, a["candidate_id"]))
+    if outcome == "warning":
+        pause(store, "Instagram warning, action block or login challenge reported by Cole")
+    n = 0 if final == "sent" else int(store.get("consecutive_unconfirmed")) + (final == "uncertain")
+    store.set("consecutive_unconfirmed", n)
+    if n >= 2 and store.get("paused") != "1":
+        pause(store, "repeated inability to confirm sends")
+    return final
+
+
+def pending_attempts(store):
+    return store.db.execute("SELECT * FROM attempts WHERE outcome='pending' ORDER BY id").fetchall()
+
+
+def next_allowed_at(store, now=None):
+    """Earliest time (UTC) the spacing/hour/day/window rules allow another attempt, scanning by minute."""
+    now = now or utcnow()
+    times = store.counted_attempt_times()
+    t = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(60 * 48):
+        if can_attempt(t, times)[0]:
+            return t
+        t += timedelta(minutes=1)
+    return None

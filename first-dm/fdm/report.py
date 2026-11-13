@@ -18,7 +18,7 @@ def dry_run_report(st, ig):
          "## 1. Capabilities and required checks", "", "| Requirement | Status | Detail |", "|---|---|---|"]
     reqs = requirement_status(st, ig)
     for _, desc, ok, detail in reqs:
-        L.append(f"| {desc} | {'verified' if ok else '**UNAVAILABLE**'} | {detail} |")
+        L.append(f"| {desc} | {('you check (manual)' if 'Cole' in detail else 'verified') if ok else '**UNAVAILABLE**'} | {detail} |")
     blocked = [d for _, d, ok, _ in reqs if not ok]
     if any("see note" in d for _, _, ok, d in reqs if not ok):
         from .cli import NO_IG_NOTE
@@ -33,13 +33,17 @@ def dry_run_report(st, ig):
         else:
             L.append(f"| {label} | — | **not loaded** | |")
 
-    L += ["", "## 3. Real candidates (live Instagram data)", ""]
+    if getattr(ig, "manual", False):
+        L += ["", "Assisted mode: Cole pastes each Reel's visible likers and sends every DM himself. "
+              "Before each send he confirms on Instagram: signed in as @colethomasrod, right profile, "
+              "he doesn't follow them, no existing DM thread, messaging allowed. Anything he can't confirm skips the person."]
+    L += ["", "## 3. Real candidates (from pasted Reel likers)", ""]
     c = Counter(r["status"] for r in st.db.execute("SELECT status FROM candidates"))
     sk = Counter(r["reason"] for r in st.db.execute("SELECT reason FROM candidates WHERE status='skipped'"))
     reels = st.db.execute("SELECT COUNT(*) c FROM reels").fetchone()["c"]
     L.append(f"Reels baselined: {reels}. Candidates: {dict(c) or 'none'}. Skips by reason: {dict(sk) or 'none'}.")
     if not reels:
-        L.append("No Reels could be monitored, so no real candidates exist yet.")
+        L.append("No Reel likers recorded yet. Use `python3 -m fdm likers <reel URL>` for each Reel.")
 
     rows, extra, samples = run_scenarios()
     L += ["", "## 4. Independent exclusion tests (TEST DATA, isolated database)", "",

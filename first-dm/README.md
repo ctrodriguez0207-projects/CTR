@@ -7,22 +7,48 @@ It needs only Python 3.9+ and the standard library.
 > **Privacy:** this repository is public. Handle lists, the queue, logs and
 > exports live in `first-dm/data/`, which is gitignored. Never commit that folder.
 
-## Current status
+## How it works: assisted mode
 
-Live sending is **blocked**. No supported way exists to read Reel likers,
-check follows or DM history, or send first DMs for @colethomasrod:
+There is no supported way to automate the Instagram side for @colethomasrod.
+The official API can't list Reel likers or follows, and it can't start a
+conversation. Automating the app or website breaks Instagram's terms. So you
+act as the Instagram link, and the workflow does everything else.
 
-- Instagram's official messaging API only lets the account message people who
-  messaged it first. It does not list Reel likers or who the account follows.
-- Driving the signed-in Instagram app or website with automation breaks
-  Instagram's terms. It also risks action blocks on the account, so this
-  workflow does not do it.
+1. **Record likers.** Run `python3 -m fdm likers <reel URL>` and paste the
+   Reel's visible likers, one handle per line. You can also pass `--file`. The
+   first paste for a Reel is the baseline, and nobody from it is queued. Later
+   pastes queue only new likers. Display names and button text such as "Follow"
+   are ignored.
+2. **Run `python3 -m fdm assist`.** For each person it:
+   - runs every list check: the other account's Following export, your personal
+     list, the SetSmart do-not-contact list and history (each no more than 24
+     hours old), and this workflow's log
+   - checks the 6 a.m.–11 p.m. Eastern window, the 5/hour and 80/day caps, and
+     the 3-minute spacing
+   - asks you to confirm on Instagram that:
+     - you're signed in as @colethomasrod
+     - the profile is the person who liked the Reel
+     - you don't follow them
+     - there's no existing DM conversation of any kind
+     - Instagram lets you message them
 
-Everything else is built and tested: lists, exclusions, the queue, the opener
-rotation, the schedule and caps, reservation and confirmation, pause and resume,
-the logs and the summaries. If a supported Instagram integration becomes
-available, implement `fdm/adapters.py::InstagramAdapter` for it. Every
-capability must report as verified before `enable-live` will accept an approval.
+   Answering "?" (can't tell) skips the person. Answering "no" to the
+   signed-in question pauses everything.
+3. **Send it by hand.** Once you've confirmed, the attempt is reserved and
+   counted, and the rotation advances. The tool shows the exact message to paste.
+   You send it yourself, then report one of:
+   - **y:** it appeared in their conversation, so it's logged as sent
+   - **u:** you're unsure, so it's logged as uncertain
+   - **n:** you didn't send it; it still counts toward the caps
+   - **w:** Instagram showed a warning, block or challenge; this pauses everything
+
+   Whatever you answer, that person is never offered again.
+4. **Unfinished attempts.** If you quit mid-attempt, the next `assist` asks how
+   it ended before offering anyone else.
+
+`python3 -m fdm run` (automatic sending) refuses to run because no supported
+Instagram integration exists. If one ever does, implement
+`fdm/adapters.py::InstagramAdapter` for it.
 
 ## Commands (run inside `first-dm/`)
 
@@ -31,7 +57,8 @@ capability must report as verified before `enable-live` will accept an approval.
 | See mode, pause state and every required check | `python3 -m fdm status` |
 | Produce the dry-run report (no sends) | `python3 -m fdm dry-run` |
 | Approve the dry run and go live (one approval) | `python3 -m fdm enable-live --approve <DRY_RUN_ID>` |
-| Start the single sender | `python3 -m fdm run` |
+| Record a Reel's visible likers | `python3 -m fdm likers https://www.instagram.com/reel/XXXX/` (then paste) |
+| Send the next first DMs, guided | `python3 -m fdm assist` (`--once` for a single one) |
 | Pause, which blocks the next send | `python3 -m fdm pause "reason"`, or create the file `data/PAUSE` |
 | Resume after a pause | `python3 -m fdm resume` (refuses while any required check is unavailable) |
 | Add to the personal do-not-contact list | `python3 -m fdm personal add handle1 @handle2` or `--file list.txt` |
@@ -52,18 +79,18 @@ Between Following exports, add new @coletrodriguez_ follows with `personal add`.
   first messages) as CSV. Each needs a `handle` or `username` column; an
   `account_id` column and a `status` column are optional.
 - Import both with `--exported-at` set to the time you exported them.
-- A list counts as stale once it is more than **24 hours** old. Before every
-  send, the sender checks freshness and pauses if either list is stale or missing.
+- A list counts as stale once it is more than **24 hours** old. Every `assist`
+  step checks freshness and pauses if either list is stale or missing, so
+  re-export both each day before sending.
 
 ## What must keep running
 
-- `python3 -m fdm run` must stay running on a machine that is always on. It does
-  not depend on Claude Code or a browser.
-- If the process stops, nothing sends. On restart it does **not** send catch-up
-  batches, because the caps and 3-minute spacing are rebuilt from the log.
-- Any attempt that was interrupted mid-send is marked uncertain and never retried.
-- All state lives in `data/state.db` (SQLite): the queue, the lists, the
-  attempts, the counters and the opener rotation.
+- **Nothing runs in the background.** Run `assist` whenever you want to send.
+  Closing it, Claude Code or a browser loses nothing.
+- **No catch-up batches.** The caps and spacing are rebuilt from the log every
+  time, and slots you don't use expire.
+- **State:** everything lives in `data/state.db` (SQLite): the queue, the lists,
+  the attempts, the counters and the opener rotation. Back up `data/`.
 
 ## Rules enforced
 
