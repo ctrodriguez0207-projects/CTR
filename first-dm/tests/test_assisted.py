@@ -154,3 +154,19 @@ class AssistCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DroppedSetSmart(unittest.TestCase):
+    def test_runs_without_setsmart_but_old_matches_still_exclude(self):
+        st = seed(os.path.join(tempfile.mkdtemp(), "s.db"))
+        st.replace_list("setsmart_dnc", [("fan_a", None)], "t",
+                        exported_at=(datetime.now(UTC) - timedelta(days=5)).isoformat())   # stale
+        self.assertTrue(assist_next(st, now=T)[1].startswith("paused"))
+        st.set("paused", "0")
+        st.set("setsmart_required", "0")
+        st.set("setsmart_dropped_reason", "test")
+        c, _, _ = assist_next(st, now=T)
+        self.assertEqual(c["handle"], "fan_b")   # fan_a still excluded by the old import
+        st.db.execute("DELETE FROM list_meta WHERE list_name LIKE 'setsmart%'")
+        st.db.execute("DELETE FROM list_entries WHERE list_name LIKE 'setsmart%'")
+        self.assertEqual(assist_next(st, now=T)[0]["handle"], "fan_b")

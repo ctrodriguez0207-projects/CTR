@@ -42,6 +42,9 @@ def list_status(store, name, now=None):
     if name == "personal_dnc":
         n = store.list_count(name)
         return (meta is not None, f"{n} handles" if meta else "never loaded")
+    if name.startswith("setsmart") and store.get("setsmart_required") == "0":
+        return True, ("NOT REQUIRED — " + store.get("setsmart_dropped_reason")
+                      + (f"; an older import of {meta['count']} handles is still applied" if meta else ""))
     if not meta:
         return False, "not loaded"
     if name == "other_following":
@@ -152,6 +155,13 @@ def evaluate(store, ig, handle, account_id=None, strict=True):
 
 
 def _list_check(store, rec, strict, name, check, handle, account_id):
+    if name.startswith("setsmart") and store.get("setsmart_required") == "0":
+        # Dropped by Cole; any previously imported SetSmart entries still exclude.
+        if store.list_meta(name) is not None and store.in_list(name, handle, account_id):
+            rec(check, "excluded", "matched earlier SetSmart import")
+        else:
+            rec(check, "not_used", "SetSmart not required")
+        return
     ok, why = list_status(store, name)
     if store.list_meta(name) is None or (not ok and name != "other_following"):
         # Missing or stale list: cannot rely on it.

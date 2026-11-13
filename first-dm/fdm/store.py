@@ -37,6 +37,8 @@ DEFAULTS = {
     "setsmart_max_age_hours": "24",
     "approved_dry_run_id": "",
     "consecutive_unconfirmed": "0",
+    "setsmart_required": "1",
+    "setsmart_dropped_reason": "",
 }
 
 

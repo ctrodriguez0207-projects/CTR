@@ -254,6 +254,45 @@ def cmd_assist(a):
     return 0
 
 
+def cmd_step(a):
+    """Non-interactive assist, one stage at a time (for driving from chat)."""
+    st = get_store()
+    if a.stage == "next":
+        pend = pending_attempts(st)
+        if pend:
+            for p in pend:
+                print(f"PENDING attempt {p['id']} to @{p['handle']}: \"{p['message']}\" — report it with: step result {p['id']} y|u|n|w")
+            return 0
+        r = assist_next(st, pause_file=PAUSE_FILE)
+        if r[0] is None:
+            print(r[1])
+            return 0
+        c, opener, text = r
+        print(f"candidate {c['id']}: @{c['handle']} (Reel {c['source_reel']}) https://www.instagram.com/{c['handle']}/ "
+              f"— would get opener #{opener}: \"{text}\"")
+        print("Confirm: signed in as @colethomasrod? right profile? you follow them? any DM thread? can message?")
+        return 0
+    if a.stage == "confirm":
+        vals = [YN[v] for v in a.args[1:6]] if len(a.args) == 6 and all(v in YN for v in a.args[1:6]) else None
+        if not vals:
+            print("usage: step confirm CANDIDATE_ID signed_in profile follows thread can_message   (each y/n/?)")
+            return 2
+        keys = ["signed_in_as_sender", "intended_recipient", "follows", "dm_thread", "can_message"]
+        res = assist_reserve(st, int(a.args[0]), dict(zip(keys, vals)), pause_file=PAUSE_FILE)
+        if res[0] == "reserved":
+            print(f"RESERVED attempt {res[1]} (counted). Send this exact message, opener #{res[2]}:\n{res[3]}")
+        else:
+            print(f"{res[0]}: {res[1]}")
+        return 0
+    if a.stage == "result":
+        if len(a.args) != 2 or a.args[1] not in ("y", "u", "n", "w"):
+            print("usage: step result ATTEMPT_ID y|u|n|w")
+            return 2
+        out = assist_result(st, int(a.args[0]), {"y": "sent", "u": "uncertain", "n": "not_sent", "w": "warning"}[a.args[1]])
+        print(f"Recorded: {out}")
+        return 0
+
+
 def cmd_status(a):
     st = get_store()
     ig = get_ig()
@@ -262,7 +301,7 @@ def cmd_status(a):
     print(f"Next opener: #{int(st.get('rotation_pos')) % 4 + 1} (rotation position {st.get('rotation_pos')})")
     print("\nRequired checks:")
     for name, desc, ok, detail in requirement_status(st, ig):
-        print(f"  [{('YOU' if 'Cole' in detail else 'OK ') if ok else 'NO '}] {desc}\n         {detail}")
+        print(f"  [{('N/A' if detail.startswith('NOT REQUIRED') else 'YOU' if 'Cole' in detail else 'OK ') if ok else 'NO '}] {desc}\n         {detail}")
     c = Counter(r["status"] for r in st.db.execute("SELECT status FROM candidates"))
     print("\nCandidates:", dict(c) or "none yet")
     pend = pending_attempts(st)
@@ -338,7 +377,7 @@ def cmd_enable_live(a):
     st.set("pause_reason", "")
     PAUSE_FILE.unlink(missing_ok=True)
     st.event("live_enabled", dry_run_id=a.approve)
-    print("Live sending enabled. Start the sender with: python3 -m fdm run")
+    print("Live sending enabled. Send with: python3 -m fdm assist")
     return 0
 
 
@@ -386,6 +425,7 @@ def cmd_summary(a):
     p, why = is_paused(st, PAUSE_FILE)
     lines = [f"# First-DM summary for {day} (Eastern)", "",
              f"- Mode: {st.get('mode')}; sending is {'PAUSED (' + why + ')' if p else 'active'}",
+             *([f"- SetSmart checks: not used ({st.get('setsmart_dropped_reason')})"] if st.get("setsmart_required") == "0" else []),
              f"- Confirmed sends: {c['sent']}", f"- Uncertain attempts: {c['uncertain']}", f"- Reserved but not sent by Cole: {c['not_sent']}",
              f"- Waiting for Cole's answer: {c['pending']}",
              f"- Other outcomes: {dict((k, v) for k, v in c.items() if k not in ('sent', 'uncertain', 'not_sent', 'pending')) or 'none'}",
@@ -417,6 +457,15 @@ def cmd_config(a):
     if a.setsmart_max_age_hours is not None:
         st.set("setsmart_max_age_hours", a.setsmart_max_age_hours)
         print(f"SetSmart lists must be at most {a.setsmart_max_age_hours} h old.")
+    if a.drop_setsmart:
+        st.set("setsmart_required", "0")
+        st.set("setsmart_dropped_reason", a.drop_setsmart)
+        st.event("setsmart_dropped", reason=a.drop_setsmart)
+        print(f"SetSmart is no longer required. Reason recorded: {a.drop_setsmart}")
+    if a.require_setsmart:
+        st.set("setsmart_required", "1")
+        st.event("setsmart_required")
+        print("SetSmart lists are required again (24 h freshness).")
     return 0
 
 
@@ -446,6 +495,10 @@ def main(argv=None):
     p = sp.add_parser("assist", help="walk through the next first DMs you send by hand")
     p.add_argument("--once", action="store_true", help="stop after one attempt")
     p.set_defaults(f=cmd_assist)
+    p = sp.add_parser("step", help="assist one stage at a time: next | confirm | result")
+    p.add_argument("stage", choices=["next", "confirm", "result"])
+    p.add_argument("args", nargs="*")
+    p.set_defaults(f=cmd_step)
     sp.add_parser("dry-run").set_defaults(f=cmd_dry_run)
     p = sp.add_parser("enable-live")
     p.add_argument("--approve", required=True, metavar="DRY_RUN_ID")
@@ -462,6 +515,8 @@ def main(argv=None):
     p.set_defaults(f=cmd_summary)
     p = sp.add_parser("config")
     p.add_argument("--setsmart-max-age-hours", type=float)
+    p.add_argument("--drop-setsmart", metavar="REASON", help="stop requiring SetSmart lists (reason is logged)")
+    p.add_argument("--require-setsmart", action="store_true")
     p.set_defaults(f=cmd_config)
     a = ap.parse_args(argv)
     return a.f(a)

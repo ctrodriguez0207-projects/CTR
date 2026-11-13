@@ -18,7 +18,7 @@ def dry_run_report(st, ig):
          "## 1. Capabilities and required checks", "", "| Requirement | Status | Detail |", "|---|---|---|"]
     reqs = requirement_status(st, ig)
     for _, desc, ok, detail in reqs:
-        L.append(f"| {desc} | {('you check (manual)' if 'Cole' in detail else 'verified') if ok else '**UNAVAILABLE**'} | {detail} |")
+        L.append(f"| {desc} | {('not required' if detail.startswith('NOT REQUIRED') else 'you check (manual)' if 'Cole' in detail else 'verified') if ok else '**UNAVAILABLE**'} | {detail} |")
     blocked = [d for _, d, ok, _ in reqs if not ok]
     if any("see note" in d for _, _, ok, d in reqs if not ok):
         from .cli import NO_IG_NOTE
